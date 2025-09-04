@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# Умный скрипт обновления Docker-сервиса с бэкапом volume
-# Имя бэкапа: <volume_name>_<timestamp>.tar.gz
-# Использует docker-compose с явным указанием проекта
+# Умный скрипт обновления Docker-сервиса с бэкапом volume и БД
+# Имя бэкапа: <volume/db_name>_<timestamp>.tar.gz / .sql
 
 set -euo pipefail
 
 # === НАСТРОЙКА: Укажите имя проекта Docker Compose ===
-PROJECT_NAME="my_project"
+PROJECT_NAME="my-poject"
 # ===================================================
 
 usage() {
@@ -15,7 +14,7 @@ usage() {
 Использование: $0 --service <имя_сервиса> --compose <путь_к_docker-compose.yml> --env <путь_к_.env>
 
 Пример:
-    $0 --service my_project_frontend --compose ./docker-compose.yml --env ./.env
+    $0 --service my-poject_frontend --compose ./docker-compose.yml --env ./.env
 
 Опции:
     --service   Имя сервиса (как в docker-compose.yml)
@@ -110,27 +109,26 @@ dc config --services | grep -q "^$SERVICE_NAME$" || {
     echo "---------------------"
     dc config --services || echo "Не удалось загрузить список сервисов."
     echo "---------------------"
-    echo "💡 Убедитесь, что имя сервиса указано точно (с учётом - и _)"
+    echo "💡 Убедитесь, что имя сервиса указано точно"
     exit 1
 }
 
-# Проверка, запущен ли контейнер
-echo "🔍 Проверка статуса контейнера..."
-dc ps "$SERVICE_NAME" >/dev/null || {
-    echo "❌ Сервис '$SERVICE_NAME' не запущен или не существует в проекте '$PROJECT_NAME'."
-    echo "💡 Запустите сервис сначала: docker-compose -p $PROJECT_NAME up -d $SERVICE_NAME"
-    exit 1
-}
+# === Поиск контейнера через docker-compose ===
+echo "🔍 Поиск контейнера для сервиса '$SERVICE_NAME'..."
 
-# Получаем ID контейнера
-CONTAINER_ID=$(dc ps -q "$SERVICE_NAME" | tr -d '[:space:]')
+CONTAINER_ID=$(dc ps -q "$SERVICE_NAME" 2>/dev/null)
+
 if [ -z "$CONTAINER_ID" ]; then
-    echo "❌ Не удалось получить ID контейнера для сервиса '$SERVICE_NAME'"
+    echo "❌ Контейнер для сервиса '$SERVICE_NAME' не найден."
+    echo "💡 Убедитесь, что сервис запущен."
+    echo "📋 Запущенные контейнеры (фильтр по имени сервиса):"
+    docker ps --filter "name=${SERVICE_NAME}" --format "table {{.Names}}\t{{.Status}}"
     exit 1
 fi
+
 echo "✅ Найден контейнер: $CONTAINER_ID"
 
-# === Получение имени volume через docker inspect (надёжно) ===
+# === Получение имени volume через docker inspect ===
 echo "🔍 Определение volume через docker inspect..."
 
 VOLUME_NAME=$(docker inspect "$CONTAINER_ID" --format '
@@ -144,24 +142,50 @@ VOLUME_NAME=$(docker inspect "$CONTAINER_ID" --format '
 if [ -n "$VOLUME_NAME" ]; then
     echo "✅ Найден volume: $VOLUME_NAME"
 else
-    echo "⚠️  Не найдено volume-маунтов. Используем имя сервиса."
+    echo "⚠️  У сервиса нет volume-маунтов. Используем имя сервиса."
     VOLUME_NAME="$SERVICE_NAME"
 fi
 
-# === Генерация имени бэкапа ===
-BACKUP_NAME="${VOLUME_NAME}_${TIMESTAMP}.tar.gz"
-BACKUP_PATH="$BACKUP_SERVICE_DIR/$BACKUP_NAME"
+# === Бэкап БД (если это сервис db_postgres) ===
+if [ "$SERVICE_NAME" = "db_postgres" ]; then
+    echo "💾 Создание бэкапа базы данных PostgreSQL..."
 
-# === Остановка и бэкап ===
+    # Загружаем параметры из .env
+    DB_NAME=$(grep "^POSTGRES_DB=" "$ENV_FILE" | cut -d'=' -f2)
+    DB_USER=$(grep "^POSTGRES_USER=" "$ENV_FILE" | cut -d'=' -f2)
+    DB_CONTAINER="my-poject_db"
+
+    if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
+        echo "❌ Не удалось получить параметры БД из .env"
+        exit 1
+    fi
+
+    DB_BACKUP_NAME="${DB_NAME}_${TIMESTAMP}.sql"
+    DB_BACKUP_PATH="$BACKUP_SERVICE_DIR/$DB_BACKUP_NAME"
+
+    echo "📦 Создание бэкапа БД: $DB_BACKUP_NAME"
+    if docker exec "$DB_CONTAINER" pg_dump -U "$DB_USER" -d "$DB_NAME" --clean --if-exists > "$DB_BACKUP_PATH"; then
+        echo "✅ Бэкап БД создан: $DB_BACKUP_PATH"
+    else
+        echo "❌ Ошибка при создании бэкапа БД!"
+        exit 1
+    fi
+fi
+
+# === Генерация имени бэкапа контейнера ===
+CONTAINER_BACKUP_NAME="${VOLUME_NAME}_${TIMESTAMP}.tar.gz"
+CONTAINER_BACKUP_PATH="$BACKUP_SERVICE_DIR/$CONTAINER_BACKUP_NAME"
+
+# === Остановка и бэкап контейнера ===
 echo "🛑 Остановка сервиса..."
 dc stop "$SERVICE_NAME" >/dev/null 2>&1 || true
 
-# === Создание бэкапа ===
-echo "📦 Создание бэкапа: $BACKUP_NAME"
-if docker export "$CONTAINER_ID" | gzip -c > "$BACKUP_PATH" 2>/dev/null; then
-    echo "✅ Бэкап успешно создан: $BACKUP_PATH"
+# === Создание бэкапа файловой системы контейнера ===
+echo "📦 Создание бэкапа контейнера: $CONTAINER_BACKUP_NAME"
+if docker export "$CONTAINER_ID" | gzip -c > "$CONTAINER_BACKUP_PATH" 2>/dev/null; then
+    echo "✅ Бэкап контейнера создан: $CONTAINER_BACKUP_PATH"
 else
-    echo "❌ Ошибка при создании бэкапа!"
+    echo "❌ Ошибка при создании бэкапа контейнера!"
     exit 1
 fi
 
@@ -191,5 +215,8 @@ fi
 # === Финал ===
 echo
 echo "🎉 === Обновление завершено ==="
-echo "💾 Бэкап сохранён: $BACKUP_PATH"
-echo "💡 Для восстановления используйте: restore-service.sh --service $SERVICE_NAME --backup '$BACKUP_PATH'"
+echo "💾 Бэкап контейнера: $CONTAINER_BACKUP_PATH"
+if [ "$SERVICE_NAME" = "db_postgres" ]; then
+    echo "💾 Бэкап БД: $DB_BACKUP_PATH"
+fi
+echo "💡 Для восстановления используйте: restore-service.sh"
